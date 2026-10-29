@@ -4,6 +4,8 @@
 **Scope:** `01_SRS.md`, `02_System_Design.md`, `03_Build_Plan.md` v1.0, read against the Case Study 3 problem statement.
 **Result:** the architecture holds up (eBPF marking, HTB with floors and ceilings, a delay-based estimator, a deterministic policy layer, safe-mode fallback). However, v1.0 had **4 defects that would make the headline scenarios fail**, 8 high-impact realism gaps, and a set of speed and simplicity improvements. All accepted changes are applied in the v1.1 documents. Section 5 lists what was kept and why.
 
+> **Later changes (v1.2, 2026-10-30):** the plumbing and leak audit in `07_Plumbing_and_Leak_Audit.md` refines several fixes from this review. The "20th packet" event rule (R-14) now handles GSO jumps (L-08). G1 (R-07) now sits in a fixed precedence below user overrides (L-02). The verifier attribution rules (R-25) gained inverse-action rollback and truncated windows (L-12, L-23). The systemd settings (R-26) gained a heartbeat-gated watchdog (L-07). Rate changes from the estimator (R-13) now reach the kernel through a single-writer fast path (L-01). Where this document and the v1.2 design differ, the design is authoritative.
+
 Severity: **CRITICAL** = a headline scenario or a hard constraint fails as written. **HIGH** = an expert judge will spot it, or results become misleading. **MEDIUM** = speed, simplicity or robustness.
 
 Anything that depends on kernel behaviour I could not demonstrate here is marked **[spike]** and added to design §22 as SP-8 to SP-13.

@@ -1,9 +1,9 @@
 # System Design Document
 
 **Project:** Adaptive QoS Engine for Mixed Home Broadband Traffic (`qosd`)
-**Document version:** 1.1 (2026-10-29: applies `04_Design_Review.md`; R-xx tags point to the review finding behind each change)
+**Document version:** 1.2 (2026-10-30: applies `07_Plumbing_and_Leak_Audit.md`; L-xx tags point to the leak behind each change. v1.1 2026-10-29 applied `04_Design_Review.md`; R-xx tags)
 **Date:** 2026-10-28
-**Related:** `01_SRS.md` (requirements), `03_Build_Plan.md` (phased plan), `04_Design_Review.md` (v1.0 → v1.1 review)
+**Related:** `01_SRS.md` (requirements), `03_Build_Plan.md` (phased plan), `04_Design_Review.md` (v1.0 → v1.1 review), `07_Plumbing_and_Leak_Audit.md` (v1.1 → v1.2 audit)
 
 > **How to read this:** sections 1–4 give the big picture. Section 5 specifies every module with its inputs, outputs, state, failure handling, success condition and test approach (the problem statement asks for exactly that). Sections 6–12 hold the exact data structures, commands, algorithms and APIs. Sections 13–22 cover operations, testing, the production boundary, and the items that must be verified in Phase 0 before we rely on them.
 
@@ -100,10 +100,15 @@ flowchart LR
 | eBPF datapath | per packet | packet headers, `class_map` | `flow_stats`, `skb->mark`, `skb->priority`, `events` ring buffer (one event per flow at packet 20) |
 | RTT probing | 10 Hz per reflector (3 reflectors = 30 probes/s, a sample every ≈ 33 ms) | ICMP echo replies | RTT samples |
 | Estimator | 50 ms tick; throughput over a sliding 250 ms window | RTT samples; download arrival bytes (eBPF `dir_bytes`), upload root-class bytes (tc stats over one persistent netlink socket) | shaper rate R (per direction) |
-| Classifier | 1 s, plus immediately on each "20th packet" event | `flow_stats` (batch read) | `class_map` |
+| Classifier | 1 s, plus immediately on each "20th packet" event | `flow_stats` (batch read) | class decisions → class resolver |
+| Class resolver + reconciliation | 1 s (L-02) | decisions, overrides, intent pins, guardrails; `class_map` (batch read) | missing or different `class_map` entries, via the enforcer |
+| Rate fast path | on every estimator change (L-01) | R per direction, current profile | class rates → enforcer queue (decreases immediately, increases ≤ every 250 ms and only if ≥ 1%) |
 | Flow reaper | 1 s (with the classifier) | `flow_stats` last-seen times and FIN/RST flags | deletes idle flows from both maps |
-| Neighbour table | event-driven (netlink RTNLGRP_NEIGH) | neighbour events | `DeviceMap` |
-| Policy engine | 1 s tick + events (intent, estimator, verifier) | classes, R, intents, verdicts | desired tc config |
+| Neighbour and address tables | event-driven (netlink neighbour + address groups); full resync on `ENOBUFS` and every 60 s (L-14) | netlink events and dumps | `DeviceMap`, `gw_addrs` |
+| Policy engine | 1 s tick + events (intent, verifier, health) | intents, verdicts, health | profile and FSM state (rates take the fast path above) |
+| Enforcer | continuous; the **only** writer of tc and `class_map` (L-01) | command queue | netlink / `tc -batch` |
+| Watchdog | every 2 s, only if all loops reported progress (L-07) | heartbeats | `sd_notify(WATCHDOG=1)` |
+| State file | every 1 s (L-28) | R, C_est, baselines, policy state | `/run/qosd/state.json` (write + rename) |
 | Verifier | continuous; 10 s windows around each action | KPIs | verdicts, rollback requests |
 | Metrics scrape | Prometheus, 1 s | `/metrics` | TSDB |
 
@@ -116,9 +121,10 @@ flowchart LR
 2. At **`lan0` tcx egress**, the eBPF program `lan_egress`:
    - if the frame is not IP (e.g. ARP): sets the RT priority (fast lane, FR-ENF-10) and returns,
    - if the source is the gateway's own address: sets the direct-path priority `0x00010000` and returns (R-16; not WAN traffic),
+   - if the packet is a fragment (more-fragments set or offset ≠ 0): counts it and leaves `skb->priority` unchanged, so the whole datagram uses DEFAULT (L-19),
    - builds the canonical flow key (client = destination address),
    - updates the DOWN counters in `flow_stats`, and adds `skb->len` to the per-CPU `dir_bytes` counter. That counter is the estimator's download T_obs: what the modem delivered, measured before our shaper (§8.2),
-   - looks up `class_map[key]`. **Only if it finds a valid code 1–4** does it set `skb->priority = 0x00010000 | (class_code << 4)`, which selects HTB class `1:10`, `1:20`, `1:30` or `1:40`. On a miss it applies the fast lane (DNS/ICMP → RT) or leaves `skb->priority` unchanged.
+   - looks up `class_map[key]`. **Only if it finds a valid code 1–4** does it set `skb->priority = 0x00010000 | (class_code << 4)`, which selects HTB class `1:10`, `1:20`, `1:30` or `1:40`. On a miss it checks `device_pin[client]` (intent with scope `all`, L-21), then the fast lane (DNS/ICMP → RT), and otherwise leaves `skb->priority` unchanged.
 3. The `lan0` root HTB qdisc picks the leaf class directly from `skb->priority` when it matches an existing leaf classid of that qdisc. Otherwise it uses `default 30` (DEFAULT).
 4. The leaf qdisc (fq_codel or CAKE) applies per-flow or per-host fairness and AQM.
 
@@ -129,10 +135,16 @@ flowchart LR
 2. At **`lan0` tcx ingress**, the eBPF program `lan_ingress`:
    - builds the canonical key (client = source address),
    - updates the UP counters,
-   - looks up the class (or the fast-lane rule) and writes it into the low byte of `skb->mark`, keeping the other mark bits,
+   - looks up the class (or `device_pin`, or the fast-lane rule; fragments excluded) and writes it into the low byte of `skb->mark`, keeping the other mark bits,
    - **pure-ACK promotion (R-06, FR-ENF-9):** if the class is BULK and the packet is a TCP segment with only the ACK flag set and no payload (IP total length − IP header length − TCP data offset = 0; header fields only), it writes DEFAULT instead.
 3. The packet is routed and masqueraded (IPv4) to `wan0`.
-4. At **`wan0` tcx egress**, the eBPF program `wan_egress` reads `c = skb->mark & 0xff`. If `c` is 1–4 it sets `skb->priority = 0x00010000 | (c << 4)`. If `c` is 0 it **leaves `skb->priority` alone**, which keeps router-originated traffic in DEFAULT and keeps the estimator probes on the direct path (§4.4). The HTB on `wan0` then selects the class.
+4. At **`wan0` tcx egress**, the eBPF program `wan_egress`:
+   - if `skb->priority` is already `0x00010000` (estimator probes): leaves it, so probes stay on the direct path (§4.4),
+   - reads `c = skb->mark & 0xff`. If `c` is 1–4 it sets `skb->priority = 0x00010000 | (c << 4)`,
+   - if `c` is 0 (router-originated or unclassified): non-IP frames (ARP, PPPoE control), ICMP/ICMPv6 and DNS go to RT (fast lane, L-18); everything else keeps its priority and lands in DEFAULT.
+   The HTB on `wan0` then selects the class.
+
+**Mark conflicts (L-15):** another netfilter rule that writes `skb->mark` without a mask (e.g. `meta mark set ct mark`) after our ingress hook would erase the class. At start the agent scans the nftables/iptables rules for mark writes overlapping `mark_mask` and raises `MARK_CONFLICT`; `mark_mask` is configurable. **Spike SP-14** reproduces the conflict.
 
 **Why `skb->mark` for upload instead of setting `skb->priority` at ingress:** the IPv4 forwarding path rewrites `skb->priority` from the packet's TOS byte (`ip_forward()` sets `skb->priority = rt_tos2priority(iph->tos)`). A priority set at LAN ingress would therefore be lost. `skb->mark` survives forwarding and NAT inside the same network namespace. **Phase 0 spike SP-3 verifies this on our exact kernel.**
 
@@ -160,12 +172,14 @@ Every module follows the same template. "Test" means the test can run without ro
 | Hooks | `lan_ingress` (tcx ingress `lan0`), `lan_egress` (tcx egress `lan0`), `wan_egress` (tcx egress `wan0`) |
 | Inputs | Ethernet (+ one 802.1Q tag), IPv4/IPv6 (+ up to 4 extension headers) and TCP/UDP headers; `class_map`; `gw_addrs` |
 | Outputs | `flow_stats` updates; `skb->mark` low byte (upload); `skb->priority` (both directions, only for a valid class, the fast lane or gateway-to-LAN traffic); `events` ring buffer |
-| State | `flow_stats` (LRU hash, 16,384 entries), `class_map` (LRU hash, 16,384 entries), `gw_addrs` (array: the gateway's own LAN addresses, written by the agent), `events` (ring buffer, 64 KB), `counters` (per-CPU array: parsed, unparsed, ipv6, fragments) |
+| State | `flow_stats` (LRU hash, 16,384 entries), `class_map` (LRU hash, 16,384 entries), `device_pin` (hash, 64 entries: client IP → class, L-21), `gw_addrs` (array: the gateway's own LAN addresses, rewritten by the agent on every address change), `dir_bytes` (per-CPU array), `events` (ring buffer, 64 KB), `counters` (per-CPU array: parsed, unparsed, ipv6, fragments) |
 | Parsing rules (R-10, FR-TEL-3) | Honour IHL; for non-first fragments, count the packet against a port-less key and never read the bytes where ports would be (they are payload); walk extension headers with a bounded loop; direct packet access with bounds checks, and `bpf_skb_pull_data` only if the headers are not in the linear area |
 | GSO (R-20, FR-TEL-9) | `pkts += max(1, skb->gso_segs)`; size bin from `skb->len / max(1, gso_segs)`. Correct with GRO/TSO on; the testbed still disables offloads for clean measurements |
-| Events (R-14, FR-CLS-12) | A `total_pkts` counter is incremented with an atomic fetch-and-add; the CPU that sees the old value 19 emits one `{flow_key}` event. One event per flow, never per packet |
+| Events (R-14, FR-CLS-12) | A `total_pkts` counter is incremented by `n = max(1, gso_segs)` with an atomic fetch-and-add; the CPU whose old value satisfies `old < 20 && old + n >= 20` emits one `{flow_key}` event (L-08: with GSO the counter can jump past 19). One event per flow, never per packet |
+| Sizes (L-22) | Size bins and features use the L3 length (IPv4 total length, IPv6 payload length + 40; for GSO, `gso_size` + header lengths), not `skb->len` |
+| Return code (L-16) | `TCX_NEXT`, so programs attached after ours still run (**spike SP-15**) |
 | Build | Only UAPI `__sk_buff` and packet headers are used, so no `vmlinux.h`/CO-RE is needed (R-22) |
-| Failure handling | Any parse failure → increment `unparsed`, leave the packet unmarked (it goes to DEFAULT). Ring buffer full → event dropped (the 1 s cycle still classifies the flow). Always return "pass"; the program never drops packets |
+| Failure handling | Any parse failure → increment `unparsed`, leave the packet unmarked (it goes to DEFAULT). Ring buffer full → event dropped (the 1 s cycle still classifies the flow). The program never drops packets |
 | Success condition | Counters match generator ground truth within ±1% in a controlled test; no forwarding errors; cost per packet measured (NFR-PERF-6) |
 | Test | `BPF_PROG_TEST_RUN` with crafted packets: IPv4/IPv6 TCP/UDP, IPv4 options, VLAN, IPv4 and IPv6 fragments (assert no port read), extension-header chains, pure ACKs, GSO packets, unclassified packets (assert priority unchanged). Needs root; runs in the VM or a hosted CI runner |
 
@@ -177,6 +191,8 @@ Every module follows the same template. "Test" means the test can run without ro
 | Outputs | `FlowWindow` records (features in §6.3); `ClassStats`; `DeviceMap`; deletions of reaped flows |
 | State | Ring buffer of the last 10 windows per flow; previous counter snapshot (for deltas) |
 | Reaping (R-19, FR-TEL-8) | Flows idle for 30 s, or for 5 s after a FIN/RST flag was seen, are batch-deleted from `flow_stats` and `class_map`. Keeps the map small, so the 1 s read stays fast and LRU eviction rarely runs |
+| User-space state GC (L-20) | All per-flow user-space state (windows, smoothing, streaks, guardrail timers) is dropped when a flow is reaped or absent from 3 consecutive batch reads (e.g. evicted by the kernel LRU) |
+| Netlink events (L-14) | Neighbour and address groups; on `ENOBUFS` (lost events) a full dump resynchronises `DeviceMap` and `gw_addrs`; a full resync also runs every 60 s |
 | Failure handling | Map read error → skip this cycle, increment `qos_telemetry_errors_total`; 3 consecutive failures → report unhealthy to the verifier |
 | Success condition | Deltas computed correctly across counter resets and LRU evictions (a flow that disappears and reappears restarts its windows) |
 | Test | Feed recorded map snapshots; assert feature values against hand-computed expectations |
@@ -186,9 +202,11 @@ Every module follows the same template. "Test" means the test can run without ro
 |---|---|
 | Responsibility | Assign one treatment class per flow, with confidence and source |
 | Inputs | `FlowWindow` stream; "20th packet" events (provisional classification from a partial window covering the flow's age so far; record mode emits such rows too, so the model is trained on them); overrides (from API); model file |
-| Outputs | `ClassDecision{flow, class, confidence, source, probs[4]}`; writes `class_map` through the enforcer |
+| Outputs | `ClassDecision{flow, class, confidence, source, probs[4]}` to the class resolver (§5.5), which alone decides what reaches `class_map` (L-02) |
 | State | Per flow: smoothed probability vector, consecutive-window counter for the hysteresis rule, current class, guardrail timers |
 | Pipeline | Stage 0 override → Stage 1/2 model (rules or ML) → Stage 3 smoothing + hysteresis → Stage 4 guardrails → abstain (algorithm in §8.1) |
+| Model reload (L-27) | `SIGHUP` loads the new `model.json`: schema and SHA-256 checked, atomic swap, the old model kept on failure; judged by the verifier as a `MODEL_RELOAD` action |
+| Corrections log (L-27) | Each user correction appends `{ts, features of the last window, predicted, corrected}` to `/var/lib/qosd/corrections.jsonl` (at most 10,000 lines, oldest dropped) |
 | Failure handling | Model missing, invalid or schema-mismatched → rule classifier + alert `CLASSIFIER_FALLBACK`. Inference error for one flow → DEFAULT for that flow |
 | Success condition | NFR-ACC-1/2 on held-out scenarios; no class flapping beyond NFR-STAB-3 |
 | Test | Replay recorded feature windows with known labels; property tests for the hysteresis rule (never switches on one noisy window) |
@@ -199,8 +217,9 @@ Every module follows the same template. "Test" means the test can run without ro
 | Responsibility | Keep the shaper rate just below the real bottleneck, per direction |
 | Inputs | RTT samples from 3 reflectors (direct path); T_obs every 50 ms, measured on the bottleneck side: download = arrival bytes at `lan0` before the shaper (eBPF per-CPU `dir_bytes`), upload = `wan0` root-class (`1:1`) bytes sent (tc stats, one persistent netlink socket) |
 | Outputs | Shaper rate R_down, R_up; capacity estimates C_est and high-water R_hw; events `CAPACITY_DROP`, `DRAIN`, `RECOVER_UP`, `LINK_DEGRADED`, `EXTERNAL_BLOAT` |
-| State | Per reflector: smoothed RTT and baseline RTT. Per direction: R, R_target, R_base, R_hw, C_est (EWMA), last cut time, ΔD at last cut, cuts in the current bloat episode, probe backoff and hold-until time, probe-cycle counter, state STEADY / CUTTING / DRAIN / RECOVERING / PROBING_UP / FROZEN |
+| State | Per reflector: smoothed RTT and baseline RTT. Per direction: R, R_target, R_base, R_hw, C_est (EWMA), last cut time, ΔD at last cut, cuts in the current bloat episode, probe backoff and hold-until time, probe-cycle counter, state ACQUIRE / STEADY / CUTTING / DRAIN / RECOVERING / PROBING_UP / FROZEN; outstanding-probe table (entries expire after 1 s and count as loss, L-20) |
 | Algorithm | §8.2 |
+| Baseline acquisition (L-05, FR-EST-11) | At every start, R = 0.5 × best known capacity (C_est from `state.json`, else nominal) for 3 s; baseline = minimum RTT in that time. Re-acquire with a 2 s dip if bloat persists 30 s while cuts no longer reduce ΔD (at most once per 5 min). Without this, a start under load learns the bloated RTT as "normal" |
 | Failure handling | Fewer than 2 reflectors responding → hold R, alert `REFLECTORS_DOWN`. Bloat with T_obs < 0.5 Mbit/s → hold, alert `EXTERNAL_BLOAT` (not our queue). R at R_min with ΔD still high for 10 s → `LINK_DEGRADED`, stop cutting |
 | Success condition | NFR-UX-2, NFR-UX-6, NFR-ACC-4, NFR-STAB-2 |
 | Test | Simulation harness: a fluid queue model driven by synthetic capacity traces. It **must model where T_obs is measured**: download T_obs = min(offered, true capacity) (measured after the bottleneck); upload T_obs = min(offered, R) (measured before it). v1.0's load-gate defect (R-01) only shows up with this model. Assert reaction time, drain time, recovery time and convergence for S2, S5 and S11 traces |
@@ -211,8 +230,12 @@ Every module follows the same template. "Test" means the test can run without ro
 | Responsibility | Turn classes, rates, intents and verdicts into one desired configuration, within hard bounds |
 | Inputs | Class decisions, R per direction, active intents, verifier verdicts, health signals |
 | Outputs | `DesiredConfig{profile, rates per class per direction, class_map updates}`; decision-log entries |
+| Rate fast path (L-01) | `Scale(R, profile)` is a pure function (profile percentages × R, RT ceiling minimum, validation) called on every estimator change; its result goes straight to the enforcer queue without waiting for the 1 s tick |
+| Class resolver (L-02, FR-POL-7) | Final class per flow = user override > guardrails (G1, G2) > intent pin > model / rules > none. User overrides are exempt from guardrails but bounded by the RT ceiling. Output is the complete desired `class_map` for live flows, reconciled by the enforcer every second |
+| Intent leases (L-06) | Deadlines on the monotonic clock; persisted to `/var/lib/qosd/intents.json` (wall-clock expiry); restored on start only if the clock is synchronised and the lease has not expired, otherwise `INTENT_LOST` is logged and shown. Device membership is re-resolved on every neighbour change; `scope=all` also fills `device_pin` |
+| Internal SAFE_MODE (L-25) | Enforcer installs the static CAKE config of §5.9; estimator rate changes and the policy stop; telemetry and eBPF keep running (CAKE ignores our priority values, whose minor number exceeds its tin count, **spike SP-16**) |
 | State | FSM: INIT, NORMAL, INTENT_ACTIVE, SAFE_MODE (§9.1); last profile-switch time; intent leases |
-| Rules | Profiles from §12; floors and ceilings enforced by validation (BULK floor ≥ 10%, RT ceiling ≤ 60%, sum of floors ≤ 100%); at most one profile switch per 5 s, except SAFE_MODE |
+| Rules | Profiles from §12; floors and ceilings enforced by validation (BULK floor ≥ 10%, RT ceiling ≤ 60% but never below min(R, 4 Mbit/s) (L-03), sum of floors ≤ 100%); intent-driven profile switches applied within 1 s, with intent events inside 1 s coalesced (L-13); SAFE_MODE immediate |
 | Failure handling | Invalid desired config (fails validation) → reject, log `POLICY_INVALID`, keep the current config |
 | Success condition | Every applied config passes validation; every change has a reason code |
 | Test | Table-driven tests: (state, event) → (new state, config); fuzz test that random inputs never produce a config violating the bounds |
@@ -220,12 +243,14 @@ Every module follows the same template. "Test" means the test can run without ro
 ### 5.6 Enforcer (`internal/enforcer`)
 | Item | Specification |
 |---|---|
-| Responsibility | Apply configurations to the kernel transactionally |
+| Responsibility | The **single writer** of tc and the kernel class table (L-01): applies configurations, rate changes and class entries |
 | Inputs | `DesiredConfig` |
 | Outputs | tc changes through netlink; `class_map` writes; audit log of equivalent `tc` commands |
-| State | Last-good snapshot (tc state + `class_map` entries managed by the agent) |
+| State | Command queue (one goroutine; per direction only the latest rate command is kept); last applied state |
+| Coalescing (L-01) | Rate decreases applied immediately; increases at most every 250 ms and only if ≥ 1% different. Worst case ≈ 20 updates/s during cuts, typically ≤ 4/s |
+| Reconciliation (L-02) | Every 1 s: batch-read `class_map` for live flows, compare with the resolver's desired entries, rewrite missing or different ones. Heals LRU evictions, lost writes and restarts |
 | Operations | **Init:** render the HTB trees and leaves (§7) into one `tc -batch` file and apply it with a single exec. That file is also the audit record, and `tc` handles `stab` and CAKE options that netlink libraries may not (R-23). **Runtime:** HTB `class change` over netlink for rates (no queue flush), always sending `rate`, `ceil`, `quantum`, `burst` and `cburst` explicitly (R-17, FR-ENF-11). If `quantum` is left out the kernel recomputes it from `r2q`; `tc` and netlink libraries also compute default bursts differently. When R crosses the low-rate threshold, `tc qdisc change` updates the fq_codel target and interval (no flush). Order: when decreasing, children first, then the parent; when increasing, the parent first. HTB itself does not reject children whose rates sum above the parent's, so this ordering and the policy validation are our only guard |
-| Failure handling | Any netlink error → restore last-good snapshot. Restore failure → request SAFE_MODE |
+| Failure handling | Any netlink error → **re-render** the desired state from current inputs (current R, profile, classes) and re-apply; an old snapshot is never replayed, because it would fight the estimator (L-12). Re-apply failure → request SAFE_MODE |
 | Success condition | Kernel state read back after apply equals desired state |
 | Test | Integration test in a namespace (root): apply, read back with `tc -j`, compare; inject failures (invalid classid) and confirm restore |
 
@@ -235,7 +260,8 @@ Every module follows the same template. "Test" means the test can run without ro
 | Responsibility | Let users and the optional assistant create intents and correct classes |
 | Inputs | HTTP requests (§11) |
 | Outputs | Intent leases to the policy engine; overrides to the classifier; state and decision queries |
-| State | Active leases (max 3), persisted override rules (`/var/lib/qosd/overrides.json`) |
+| State | Active leases (max 3, persisted, see §5.5); override rules (`/var/lib/qosd/overrides.json`): `{id, match: {device_mac, proto?, remote_port?, remote_prefix?}, class, expires_at}`, at most 256, default expiry 30 days (L-10); browser sessions |
+| Authentication (L-09) | API clients (assistant, scripts) use the bearer token. The web page never contains the token: the user signs in once and gets an `HttpOnly`, `SameSite=Strict` session cookie plus a CSRF token. Every request's `Host` header must match the gateway address (DNS-rebinding defence) |
 | Failure handling | Schema-invalid input → `400` with field errors. Over the limit → `409`. Auth missing or invalid → `401`. Rate limit → `429` |
 | Success condition | Every accepted intent is reflected in the policy state within 1 s; every lease expires on time (±1 s) |
 | Test | HTTP handler tests with a fake policy engine |
@@ -245,8 +271,8 @@ Every module follows the same template. "Test" means the test can run without ro
 |---|---|
 | Responsibility | Judge whether each action helped, and trigger rollback or SAFE_MODE on harm |
 | Inputs | KPIs: RT-probe RTT (p50/p95), probe jitter (RFC 3550), probe loss, per-class throughput, backlog and queue-delay estimate (backlog × 8 ÷ class rate), estimator state and probe-cycle count |
-| Outputs | Verdicts IMPROVED / NEUTRAL / REGRESSED per action; rollback requests; SAFE_MODE requests; freeze requests to the estimator |
-| Rules | FR-VER-1..4 (thresholds in §12) |
+| Outputs | Verdicts IMPROVED / NEUTRAL / REGRESSED / UNKNOWN per action; rollback requests (the inverse of the specific action, L-12); SAFE_MODE requests. (The v1.1 "freeze requests" output is removed: the estimator owns its oscillation freeze, L-23) |
+| Rules | FR-VER-1..5 (thresholds in §12). An action's post-window ends at the next policy action; shorter than 5 s → UNKNOWN (L-23) |
 | Attribution (R-25) | Only policy actions are judged (profile switch, intent start/end, override, config reload, classifier mode change). Estimator rate changes are never rolled back. A latency regression is not blamed on a policy action while the estimator is in CUTTING or DRAIN, because a capacity event explains it. Starvation right after a policy action → roll back that action (§8.3). Starvation with no policy action in the last 10 s means the HTB floors themselves failed (a bug) → SAFE_MODE request directly |
 | Failure handling | Missing KPIs (e.g. reflectors down) → verdict UNKNOWN, no rollback on missing data alone, alert |
 | Success condition | S6, S7, S8 behave as specified; no rollback storms (2 rollbacks in 5 minutes means SAFE_MODE, not a third rollback) |
@@ -256,8 +282,8 @@ Every module follows the same template. "Test" means the test can run without ro
 | Item | Specification |
 |---|---|
 | Responsibility | Guarantee a known safe state when the agent is not running correctly |
-| Mechanism | systemd unit with `WatchdogSec=5`, `Restart=on-failure`, `RestartSec=60`, `StartLimitIntervalSec=3600`, `StartLimitBurst=3` (systemd's restart limit then matches FR-SAF-4), `ExecStopPost=/usr/local/sbin/qos-safe-mode`, `ReadWritePaths=/var/lib/qosd /run/qosd` (needed because `ProtectSystem=strict` makes everything else read-only). The agent notifies the watchdog every 2 s. eBPF links are not pinned, so they detach when the process exits |
-| Safe config | `tc qdisc replace … root cake bandwidth <0.8 × last R> besteffort dual-dsthost ingress` on `lan0`, and `… besteffort dual-srchost nat ack-filter` on `wan0`, both with the configured `overhead`/`mpu`. Last R is read from `/run/qosd/state.json`, else from the configured fallback |
+| Mechanism | systemd unit with `WatchdogSec=5`, `Restart=on-failure`, `RestartSec=60`, `StartLimitIntervalSec=3600`, `StartLimitBurst=3` (systemd's restart limit then matches FR-SAF-4), `ExecStopPost=/usr/local/sbin/qos-safe-mode`, `ReadWritePaths=/var/lib/qosd /run/qosd` (needed because `ProtectSystem=strict` makes everything else read-only). The agent notifies the watchdog every 2 s **only if** the estimator (500 ms), enforcer (2 s), classifier (3 s) and policy (3 s) loops all reported progress within those deadlines (L-07). eBPF links are not pinned, so they detach when the process exits |
+| Safe config | `tc qdisc replace … root cake bandwidth <0.8 × last R> besteffort dual-dsthost ingress` on `lan0`, and `… besteffort dual-srchost nat ack-filter` on `wan0`, both with the configured `overhead`/`mpu`. Last R is read from `/run/qosd/state.json`, which the agent rewrites every 1 s (temp file + rename, L-28), else from the configured fallback |
 | Failure handling | If the script itself fails, it logs to the journal and leaves the HTB default class in place (still shaped and fair) |
 | Success condition | NFR-REL-1 in S8 |
 | Test | S8: `kill -9` the agent mid-run; measure time until the CAKE config is present and RT latency stays bounded |
@@ -276,7 +302,7 @@ Every module follows the same template. "Test" means the test can run without ro
 | Responsibility | One-command, reproducible baseline-vs-optimised evidence |
 | Inputs | Scenario YAML (traffic, impairment timeline, duration, seed); configuration (B0, B1, B2-rules, B2-ML); repeat count |
 | Outputs | Per-run folder: generator logs, tc snapshots, Prometheus export, metadata (versions, seeds, git commit); aggregated HTML/Markdown report with charts and confidence intervals |
-| Steps | reset testbed → apply config → start generators → apply impairment timeline → collect → teardown → analyse |
+| Steps | reset testbed (stop agent, delete `/var/lib/qosd` and `/run/qosd`, recreate namespaces so kernel maps are fresh, L-17) → apply config → start generators → apply impairment timeline → collect → teardown → analyse. A hash of the starting state goes into the run metadata |
 | Failure handling | Any step fails → mark run INVALID with reason; never silently drop runs from the report |
 | Success condition | Re-running a scenario gives the same conclusions within the reported confidence intervals |
 
@@ -286,7 +312,8 @@ Every module follows the same template. "Test" means the test can run without ro
 | Responsibility | Build the dataset, train, evaluate and export the classifier |
 | Inputs | Feature recordings (agent in record mode) labelled by generator ground truth; optional consented real captures converted with an offline extractor that mirrors the eBPF logic |
 | Outputs | `model.json` (LightGBM `dump_model()`), `model.meta.json` (schema version, feature list, thresholds, SHA-256, training data hash), evaluation report |
-| Key rules | Split by run/scenario, never by window (prevents leakage). Choose thresholds on the validation set only. Report calibration (reliability diagram, expected calibration error) |
+| Key rules | Split by run/scenario, never by window. Choose thresholds on the validation set only. Report calibration (reliability diagram, expected calibration error) |
+| Label-leakage controls (L-04, NFR-ACC-5) | Random generator mixes per client namespace in every run; DSCP marking randomised per run; no identifiers as features; S10 uses a call profile held out from training; **leakage check**: a model on only port bucket, DSCP and flows-per-device must score clearly below the full model, otherwise the dataset is fixed before any accuracy is reported |
 | Parity | A Go evaluator walks the dumped trees. A parity test asserts max absolute probability difference vs Python ≤ 1e-6 on the test set |
 
 ### 5.13 Optional LLM assistant (`assistant/`, off-gateway)
@@ -294,8 +321,8 @@ Every module follows the same template. "Test" means the test can run without ro
 |---|---|
 | Responsibility | Natural-language intent creation and plain-language explanations |
 | Tools exposed to the model | `create_intent` (calls the REST API), `get_state`, `get_decisions`, `list_flows` (all read-only except `create_intent`) |
-| Guardrails | Model output is validated against the intent JSON schema before any call. The policy engine applies its own bounds regardless. The assistant has no shell, tc or config access |
-| Deployment | Local model (e.g. through Ollama) for privacy, or a hosted API sending only the request text and anonymised logs |
+| Guardrails | Model output is validated against the intent JSON schema before any call. The user must **confirm** the parsed intent before `create_intent` runs. Tool outputs are untrusted data: device names are limited to 32 printable characters and quoted (DHCP hostnames are attacker-controlled, L-09). The policy engine applies its own bounds regardless. The assistant has no shell, tc or config access |
+| Deployment | Local model (e.g. through Ollama) for privacy, or a hosted API. In hosted mode, tool outputs replace remote IPs and MACs with pseudonymous labels (NFR-PRIV-2) |
 | Evaluation | 100-utterance test set: parse accuracy and rejection rate vs a regex/keyword parser baseline |
 | Failure handling | Model unavailable or output invalid → the web page and REST API keep working; the assistant says it couldn't parse the request |
 
@@ -335,13 +362,14 @@ struct dir_stats {
 struct flow_val {
     struct dir_stats up, down;
     __u64 first_ts_ns;
-    __u64 total_pkts;        // atomic fetch-and-add; old value 19 -> emit one event
+    __u64 total_pkts;        // atomic fetch-and-add of n; emit one event when old < 20 && old + n >= 20
     __u8  dscp_first;        // DSCP of the first packet seen
     __u8  tcp_flags_seen;    // OR of FIN/RST bits, for fast reaping
     __u8  pad[6];
 };
 // flow_stats: BPF_MAP_TYPE_LRU_HASH, key=flow_key, value=flow_val, max_entries=16384
 // class_map:  BPF_MAP_TYPE_LRU_HASH, key=flow_key, value=__u8 class_code, max_entries=16384
+// device_pin: BPF_MAP_TYPE_HASH,     key=client_ip[16], value=__u8 class_code, max_entries=64 (intent scope=all)
 // gw_addrs:   BPF_MAP_TYPE_ARRAY,    up to 8 gateway LAN addresses (16 B each)
 // dir_bytes:  BPF_MAP_TYPE_PERCPU_ARRAY, [0] = download bytes arriving at lan0 egress (before the shaper,
 //             excluding direct-path traffic); read every 50 ms as the estimator's download T_obs
@@ -361,9 +389,9 @@ struct flow_val {
 | Timing | inter-arrival mean and coefficient of variation, up and down |
 | Temporal (10-window ring) | active-seconds fraction, coefficient of variation of bytes per second, longest idle gap, total bytes so far |
 | Flow | age, L4 protocol, remote-port bucket (443 / configured real-time ports / other), DSCP of first packet |
-| Device context | number of active flows on the same client IP |
+| Device context | number of active flows on the same client IP (kept only if the leakage check of §5.12 shows it is not a proxy for the testbed topology) |
 
-The feature list and order are versioned (`schema_version`). The model metadata must match it (FR-CLS-10).
+Sizes are L3 lengths (§5.1, FR-TEL-10). The feature list and order are versioned (`schema_version`). The model metadata must match it (FR-CLS-10).
 
 ### 6.4 Decision log entry (JSON Lines)
 ```json
@@ -371,7 +399,7 @@ The feature list and order are versioned (`schema_version`). The model metadata 
  "inputs":{"load":0.97,"delta_rtt_ms":41.2,"t_obs_mbit":20.4},
  "action":{"shaper_mbit":{"from":90.0,"to":18.4}},"verdict":null,"policy_state":"NORMAL"}
 ```
-Reason codes: `INIT`, `CAPACITY_DROP`, `DRAIN`, `RECOVER_UP`, `PROBE_UP`, `FREEZE`, `LINK_DEGRADED`, `EXTERNAL_BLOAT`, `CLASS_ASSIGN`, `CLASS_CHANGE`, `GUARDRAIL_G1`, `GUARDRAIL_G2`, `OVERRIDE`, `INTENT_START`, `INTENT_END`, `ROLLBACK`, `SAFE_MODE_ENTER`, `SAFE_MODE_EXIT`, `CLASSIFIER_FALLBACK`, `POLICY_INVALID`, `REFLECTORS_DOWN`.
+Reason codes: `INIT`, `CAPACITY_DROP`, `DRAIN`, `RECOVER_UP`, `PROBE_UP`, `FREEZE`, `LINK_DEGRADED`, `EXTERNAL_BLOAT`, `CLASS_ASSIGN`, `CLASS_CHANGE`, `GUARDRAIL_G1`, `GUARDRAIL_G2`, `OVERRIDE`, `INTENT_START`, `INTENT_END`, `ROLLBACK`, `SAFE_MODE_ENTER`, `SAFE_MODE_EXIT`, `CLASSIFIER_FALLBACK`, `POLICY_INVALID`, `REFLECTORS_DOWN`, `ACQUIRE`, `INTENT_LOST`, `MARK_CONFLICT`, `MODEL_RELOAD`. Estimator decisions are logged only at state transitions and cuts; a RECOVERING phase is summarised in one entry when it ends (L-11).
 
 ---
 
@@ -403,7 +431,7 @@ At low rates one full-size packet takes longer to send than CoDel's 5 ms target,
 |---|---|
 | HTB root class at R | The single shaper that moves the queue from the modem to us |
 | HTB `rate` per class | Guaranteed floor: provable anti-starvation (BULK ≥ 10%) |
-| HTB `ceil` per class | Cap: RT can never take over the link, even if misclassified traffic lands there |
+| HTB `ceil` per class | Cap: RT can never take over the link, even if misclassified traffic lands there. The RT ceiling is never below min(R, 4 Mbit/s) (L-03): an HTB `ceil` caps a class even when the link is idle, so 40% of a 4.5 Mbit/s uplink (1.8 Mbit/s) would throttle a lone video call |
 | HTB `prio` | Lower number is served first among classes within their rate and when borrowing spare bandwidth |
 | `quantum 1514` | MTU-sized quantum; avoids HTB's "quantum is big/small" warnings at these rates. Sent on **every** change, otherwise the kernel recomputes it from `r2q` |
 | explicit `burst`/`cburst` | About 1 ms at R. Limits line-rate bursts into the modem's queue on upload, and makes the audit `tc` command really equivalent to what netlink applied |
@@ -454,7 +482,9 @@ if flow.class == RT and flow.rate_mbit > 8 for >= 5 s:                 assign(ST
 if flow.class == DEFAULT and flow.total_bytes >= 20 MB
    and flow.longest_idle_gap_last_10s < 2 s:                           assign(BULK, "guardrail")  # G2
 ```
-**Intent pinning** (FR-INT-4) is applied by the policy engine after classification: for a device under an intent, `scope=realtime` pins flows with p_smooth[RT] ≥ 0.4 to RT, and `scope=all` pins all its flows. G1 still applies to pinned flows, so a sync job on the same laptop cannot ride in RT next to the call.
+**Precedence (FR-POL-7, L-02):** these decisions feed the class resolver (§5.5), which applies user override > guardrails > intent pin > model / rules > none, and the enforcer reconciles the result into `class_map` every second.
+
+**Intent pinning** (FR-INT-4) is applied by the class resolver after classification: for a device under an intent, `scope=realtime` pins flows with p_smooth[RT] ≥ 0.4 to RT, and `scope=all` pins all its flows. G1 still applies to pinned flows, so a sync job on the same laptop cannot ride in RT next to the call.
 
 **Why G1 demotes to STREAM, not BULK:** cloud gaming and high-resolution screen sharing are latency-critical and often run well above 8 Mbit/s. STREAM takes them out from under the RT ceiling without dropping them to the lowest class.
 
@@ -473,6 +503,10 @@ if flow.class == DEFAULT and flow.total_bytes >= 20 MB
 A runnable fluid model of exactly this logic, with the v1.0 logic for comparison, is in `docs/sim/estimator_fluid_model.py`. It is the seed of the P3.0 harness.
 
 ```text
+# at start (and on re-acquisition, FR-EST-11):
+#   state = ACQUIRE; R = 0.5 * (C_est from state.json or nominal) for 3 s (2 s for a re-acquisition dip)
+#   baseline_i = min(samples_i during ACQUIRE); then state = STEADY
+
 # per reflector i, on every RTT sample s (10 Hz each, direct path):
 rtt_ewma_i = 0.3 * s + 0.7 * rtt_ewma_i
 if s < baseline_i:                       baseline_i = s                                 # fast down
@@ -563,7 +597,10 @@ for each policy action a:                     # estimator rate changes are exclu
                        or (post.rt_p95 > 2 * pre.rt_p95 and post.rt_p95 - pre.rt_p95 > 20 ms)
     # attribution: a capacity event explains latency, so the latency clause is ignored
     # while the estimator was in CUTTING or DRAIN during the post window; starvation always counts
-    if safety_violation: rollback(a)          # user intents included; the reason is shown to the user
+    # post window ends at the next policy action; shorter than 5 s -> verdict UNKNOWN, no rollback
+    if safety_violation: rollback(a)          # = inverse of a (cancel intent, remove override, previous
+                                              #   model/config/mode); INTENT_END has none -> alert only
+                                              # user intents included; the reason is shown to the user
     if rollbacks_in_last_5_min >= 2 or restore_failed: enter SAFE_MODE
 ```
 
@@ -587,7 +624,9 @@ stateDiagram-v2
 ### 9.2 Estimator FSM (per direction)
 ```mermaid
 stateDiagram-v2
-  [*] --> STEADY
+  [*] --> ACQUIRE
+  ACQUIRE --> STEADY: 3 s at 0.5 x best known capacity, baseline = min RTT
+  STEADY --> ACQUIRE: bloat 30 s while cuts no longer reduce delta (at most once per 5 min)
   STEADY --> CUTTING: bloat and L >= 0.75 (small queue)
   STEADY --> DRAIN: bloat and L < 0.75 (capacity drop), or a cut with delta >= 30 ms
   CUTTING --> CUTTING: queue still growing (500 ms apart, factor escalates)
@@ -625,6 +664,12 @@ stateDiagram-v2
 | Bloat not caused by our traffic (ISP core, reflector path) | Bloat with T_obs < 0.5 Mbit/s | Latency outside our control | Hold R, alert `EXTERNAL_BLOAT`; 2-of-3 reflectors needed anyway |
 | Probe socket loses direct path (e.g. SO_PRIORITY not honoured) | SP-8; RT backlog correlates with ΔD | Estimator reacts to our own queue | Fallback: probes in RT class as in v1.0, verifier ignores probe ΔD while RT backlog > 0 |
 | Ring buffer full | Dropped-event counter | Provisional class arrives at the next 1 s cycle | Counted; no other effect |
+| `class_map` entry evicted or write lost | 1 s reconciliation (L-02) | At most 1 s in the wrong class | Entry rewritten |
+| Agent starts while the modem queue is full | ACQUIRE state (L-05) | 3 s at reduced rate | Baseline learned from drained queue |
+| Loop deadlock (agent alive, not working) | Heartbeat-gated watchdog (L-07) | Up to 5 s stale config | Process killed → safe mode → restart |
+| Clock step at boot (no RTC) | Monotonic deadlines (L-06) | None | Leases unaffected |
+| Firewall rule overwrites our mark byte | Startup scan (L-15) | Upload classes lost | `MARK_CONFLICT` alert; change `mark_mask` |
+| Netlink event overflow | `ENOBUFS` (L-14) | Stale device or address map | Full dump resync |
 
 ---
 
@@ -636,11 +681,14 @@ stateDiagram-v2
 | `GET /intents` | List active intents | `[{"id",…}]` |
 | `DELETE /intents/{id}` | Cancel | `204` |
 | `GET /flows?class=&device=` | List flows | `[{"flow_id","client","remote","proto","class","confidence","source","probs":{…}}]` |
-| `PUT /flows/{flow_id}/class` | Correct a class | `{"class":"RT","persist":true}` → `200` |
+| `PUT /flows/{flow_id}/class` | Correct a class | `{"class":"RT","persist":true}` → `200` (with `persist`, also returns the created rule `id`) |
+| `GET /overrides` | List persisted override rules (L-10) | `[{"id","match":{…},"class","expires_at"}]` |
+| `DELETE /overrides/{id}` | Delete a rule | `204` |
+| `POST /session` / `DELETE /session` | Web-page sign-in / sign-out (L-09) | password → `HttpOnly`, `SameSite=Strict` cookie + CSRF token |
 | `GET /state` | Current policy, rates, profile | `{"policy_state","profile","shaper":{"down","up"},"capacity_estimate":{…}}` |
 | `GET /decisions?since=` | Decision log | JSON Lines entries (§6.4) |
 | `GET /healthz` | Health | `200 {"ok":true}` or `503` with reasons |
-| `GET /metrics` | Prometheus | text exposition format |
+| `GET /metrics` (separate listener `:9101`, no auth, L-24) | Prometheus | text exposition format; aggregate metrics only, no per-device or per-remote labels |
 | `GET /` | Minimal web page for intents and corrections | HTML (embedded in the binary) |
 
 Validation: `duration_s` 60..14400; at most 3 active intents (`409` otherwise); unknown device → `404`. The MAC form is resolved to current IPv4/IPv6 addresses through the neighbour table, which also handles rotating IPv6 privacy addresses.
@@ -695,6 +743,16 @@ estimator:
   degraded_hold_s: 10
   freeze_probe_cycles_per_min: 10
   freeze_s: 60
+  acquire_fraction: 0.5             # ACQUIRE: R = 0.5 x best known capacity (L-05)
+  acquire_s: 3
+  reacquire_after_s: 30             # persistent bloat while cuts no longer help
+  reacquire_dip_s: 2
+  reacquire_min_interval_s: 300
+  probe_timeout_ms: 1000            # outstanding probe expires, counted as loss (L-20)
+enforcer:
+  increase_coalesce_ms: 250         # (L-01)
+  min_rate_change_pct: 1
+  reconcile_ms: 1000                # class_map reconciliation (L-02)
 datapath:
   flow_table_entries: 16384         # reduce to 8192 if the memlock total exceeds 5 MB
   idle_reap_s: 30
@@ -702,6 +760,8 @@ datapath:
   event_at_packet: 20               # ring-buffer event for provisional classification
   fastlane: { dns_port: 53, icmp: true, non_ip: true }   # -> RT when the flow has no class
   upload_pure_ack_promote: true     # BULK pure ACKs -> DEFAULT on upload
+  device_pin_entries: 64            # intent scope=all (L-21)
+  user_state_gc_reads: 3            # drop user-space flow state after 3 absent reads (L-20)
 classifier:
   mode: ml                          # ml | rules
   model_path: /etc/qosd/model.json
@@ -719,8 +779,9 @@ classifier:
 profiles:                           # percent of R: [floor, ceiling]
   NORMAL: { RT: [20, 40], STREAM: [30, 100], DEFAULT: [20, 100], BULK: [10, 100] }
   INTENT: { RT: [40, 60], STREAM: [20, 100], DEFAULT: [20, 100], BULK: [10, 50] }
+  rt_ceil_min_mbit: 4               # RT ceiling = min(R, max(ceiling% x R, 4 Mbit/s)) (L-03)
 policy:
-  min_profile_switch_s: 5
+  intent_coalesce_ms: 1000          # replaces the v1.1 5 s dwell (L-13)
   max_intents: 3
   intent_duration_s: { min: 60, max: 14400 }
   intent_realtime_pin_prob: 0.4
@@ -740,8 +801,20 @@ safe_mode:
   max_retries_per_hour: 3
 api:
   listen: "192.168.50.1:8080"
+  metrics_listen: "192.168.50.1:9101"   # aggregate metrics only, no auth (L-24)
   token_file: /etc/qosd/api.token   # generated at install; never committed
+  password_hash_file: /etc/qosd/web.passwd   # web-page sign-in (L-09); never committed
   rate_limit_rps: 10
+overrides:
+  max_rules: 256                    # (L-10)
+  default_ttl_days: 30
+logging:
+  dir: /run/qosd/log                # tmpfs ring (L-11)
+  max_mb: 16
+  decision_retention_h: 24
+watchdog:
+  notify_s: 2
+  heartbeat_deadline_ms: { estimator: 500, enforcer: 2000, classifier: 3000, policy: 3000 }   # (L-07)
 mark_mask: 0xff
 ```
 
@@ -772,14 +845,17 @@ mark_mask: 0xff
 | `process_cpu_seconds_total`, `process_resident_memory_bytes` | — | Exposed by the Go Prometheus client's default process collector |
 
 ### 13.2 Logs
-Decision log (JSON Lines, §6.4) and an audit log of equivalent `tc` commands for every applied change. Both are rotated.
+Decision log (JSON Lines, §6.4) and an audit log: the full `tc -batch` file at init and at every profile change, plus a 1 s summary of rate changes (not one line per change). Both live in a 16 MB ring on tmpfs (`/run/qosd/log`), so router flash is written only for intents and overrides (L-11). Corrections go to `/var/lib/qosd/corrections.jsonl` (bounded).
 
 ---
 
 ## 14. Security and privacy
 - **Privacy by construction:** eBPF parses headers only; packet captures (training/validation) use `tcpdump -s 96`; published datasets contain features only, with IPs removed.
 - **Least privilege:** the systemd unit grants `AmbientCapabilities=CAP_NET_ADMIN CAP_BPF CAP_NET_RAW` (plus `CAP_PERFMON` only if the kernel requires it), with `NoNewPrivileges=yes` and `ProtectSystem=strict`.
-- **API:** bound to the LAN address; bearer token generated at install (`/etc/qosd/api.token`, mode 0600); JSON schema validation; rate limit. Without auth, any LAN device could make itself top priority, which is why auth is a Must.
+- **API:** bound to the LAN address; bearer token for API clients (`/etc/qosd/api.token`, mode 0600); session cookie for the web page, which never embeds the token; `Host`-header check; JSON schema validation; rate limit. Without auth, any LAN device could make itself top priority, which is why auth is a Must (L-09).
+- **Untrusted device data:** DHCP hostnames and other device-supplied strings are length-limited and quoted wherever they are shown or passed to the LLM assistant; intents created by the assistant need explicit user confirmation (NFR-SEC-5).
+- **Privacy of metadata:** remote addresses per device are browsing metadata. They stay on the gateway, are kept 24 h in the decision log, are pseudonymised for a hosted LLM, and never appear in `/metrics` (NFR-PRIV-2).
+- **Files:** `/var/lib/qosd` and `/run/qosd` are mode 0700, owned by the service user.
 - **Repository hygiene:** `.gitignore` for tokens and keys; `config.example.yaml` with fictitious values; a secret scanner (e.g. gitleaks) as a pre-commit hook and in CI.
 
 ---
@@ -830,6 +906,8 @@ Decision log (JSON Lines, §6.4) and an audit log of equivalent `tc` commands fo
 | `iperf3 -P 8 -R` | Multi-connection download | BULK | Throughput |
 | `iperf3 -P 2` | Upload "backup" | BULK | Throughput |
 | `web_sim` | Bursts of short HTTP fetches over TCP 443 with think times | DEFAULT | Page-fetch time |
+
+**Label-leakage controls (L-04):** in every run, each client namespace runs a random mix of 1–3 generators (a "laptop" might run a call, web browsing and a download together), and DSCP marking is randomised per run (none, correct, wrong), so neither the device nor the DSCP value identifies the class. S10 uses a call profile (packetisation and bitrate) held out from all training runs.
 
 **Timing accuracy (R-28):** receivers take kernel receive timestamps (`SO_TIMESTAMPNS`), and senders stamp each packet immediately before `sendmsg`. An idle run (no load, no shaping) measures the generators' own jitter floor, and the report states it next to every jitter result, so Python timer jitter is never reported as network jitter. `irtt` remains the independent cross-check.
 
@@ -924,6 +1002,8 @@ We reimplement ideas (for example delay-based rate control as in the open-source
 - **IPv6 extension headers:** up to 4 are walked; packets with longer chains are counted as unparsed and go to DEFAULT. Non-first fragments are counted without ports.
 - **Direction attribution:** RTT probes cannot tell upload from download congestion. The attribution heuristic (§8.2) and escalating upload cuts reduce the impact; one-way delay (ICMP timestamps or cooperative reflectors) is future work.
 - **Link-layer overhead:** the values must match the real access technology (DOCSIS, VDSL/PTM, PPPoE, ATM). The testbed uses 0 because the emulator counts the same bytes as HTB.
+- **Multicast and routed LAN subnets (L-29):** multicast IPTV, and LAN-to-LAN traffic routed between subnets through `lan0`, would be counted as WAN arrival in the download T_obs. Covered by assumption A-1; a product must exclude them.
+- **Plain HTTP on the LAN (L-30):** the token and session cookie cross the LAN unencrypted; a product would serve TLS with a device certificate.
 - **Wi-Fi WMM:** the classifier's result could be written to DSCP on LAN egress so an integrated access point picks the matching Wi-Fi access category. Not done in the prototype, listed as future work.
 - **Classifier generalisation:** testbed accuracy is on synthetic traffic. Real-world accuracy will be lower and drifts as apps change; it needs periodic retraining with consented data.
 - **Encrypted metadata trends:** QUIC, Encrypted Client Hello and DNS-over-HTTPS remove easy hints; the design relies only on statistical features for that reason.
@@ -948,3 +1028,6 @@ These are believed correct but must be demonstrated on the exact kernel and libr
 | SP-11 | CAKE `unlimited` works as an HTB leaf (no "non work-conserving" warnings) and behaves sensibly at 1–4 Mbit/s; fq_codel target/interval change applies without flush | Stable throughput, no warning in `dmesg`, no burst of drops on change | fq_codel leaves everywhere (lose per-device fairness in STREAM) |
 | SP-12 | Ring-buffer event at packet 20 arrives in user space within 10 ms | Measured p99 latency event → provisional class | 1 s cycle only (FR-CLS-12 is a Should) |
 | SP-13 | Netlink HTB class change with explicit `quantum`/`burst`/`cburst` matches what `tc` would apply | `tc -j class show` after a netlink change equals the audit command's result | Exec `tc class change` (slower, but identical) |
+| SP-14 | A netfilter rule `meta mark set ct mark` (no mask) placed after our ingress hook erases the class byte, and the startup scan detects it (L-15) | Upload lands in DEFAULT with the rule, in the right class without it; `MARK_CONFLICT` raised | Move the class to bits the firewall does not touch via `mark_mask`, or store it in the conntrack mark |
+| SP-15 | Returning `TCX_NEXT` from our tcx programs lets a second attached program run, while `TCX_PASS` ends the chain (L-16) | A test program attached after ours sees packets only with `TCX_NEXT` | clsact with `TC_ACT_UNSPEC` |
+| SP-16 | Under internal SAFE_MODE (CAKE besteffort root, handle `1:`), our priority values (`1:10`…`1:40`, `1:0`) do not change CAKE's behaviour (L-25) | Identical CAKE statistics with and without eBPF attached | Detach the marking programs in SAFE_MODE |

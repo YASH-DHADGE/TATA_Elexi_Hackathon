@@ -76,7 +76,7 @@ We do not try to name the app ("this is Zoom"). We only decide **how its packets
 
 | Class | What it is | What it needs | Guaranteed floor / ceiling |
 |---|---|---|---|
-| **RT** (real-time) | Calls, voice, games | Low delay, small bandwidth | 20% / 40% of the link |
+| **RT** (real-time) | Calls, voice, games | Low delay, small bandwidth | 20% / 40% of the link (the ceiling never drops below 4 Mbit/s, so a call is not capped on a slow but idle link) |
 | **STREAM** | TV and video streaming | Steady bandwidth; delay matters less (players buffer) | 30% / 100% |
 | **DEFAULT** | Web, apps, anything unknown | Normal treatment | 20% / 100% |
 | **BULK** | Downloads, updates, backups | Throughput, eventually | 10% / 100% |
@@ -159,8 +159,8 @@ All of this runs every 50 ms. The target is to react within **0.5 s** of a drop.
 
 ## 7. Policy, intents, verification and safety
 
-- **Policy engine.** It takes the classes, the shaper rate and any active user intents, and computes the exact queue settings. Every setting is checked against hard limits before it is applied: BULK never below 10%, RT never above 60%, at most one profile change per 5 s. Every decision is logged with a reason code.
-- **Intents.** "Prioritise this laptop for 60 minutes" creates a time-limited *lease*. While it is active, RT gets 40–60% of the link and BULK is capped at 50%. When the lease expires, everything returns to normal automatically. At most 3 intents can be active at once.
+- **Policy engine.** It takes the classes, the shaper rate and any active user intents, and computes the exact queue settings. Every setting is checked against hard limits before it is applied: BULK never below 10%, RT never above 60% (but never capped below 4 Mbit/s). One component, the *class resolver*, decides each connection's final class in a fixed order: your correction first, then the safety guardrails, then an intent, then the classifier. Every second the agent checks that the kernel still holds exactly those decisions and repairs any that went missing. Every decision is logged with a reason code.
+- **Intents.** "Prioritise this laptop for 60 minutes" creates a time-limited *lease*. While it is active, RT gets 40–60% of the link and BULK is capped at 50%. Intents take effect within 1 s, survive an agent restart, and are timed on a clock that cannot jump, so a router that sets its clock late after booting cannot end them early. When the lease expires, everything returns to normal automatically. At most 3 intents can be active at once.
 - **Verifier.** It compares call-latency measurements in the 10 s before and after each policy change. If a change made things clearly worse, or a class got zero bandwidth for 5 s, the change is **rolled back**. Two rollbacks within 5 minutes switch the system to safe mode.
 - **Safe mode.** If the agent crashes or hangs, the Linux service manager (systemd) runs a script that installs a simple, static CAKE configuration. Traffic is never left unmanaged. The eBPF programs detach automatically when the agent stops.
 - **Enforcement.** The initial queue tree is applied with one `tc -batch` command, so the same file serves as an exact audit record. Later rate changes go through netlink (the kernel's control interface), which takes microseconds and never empties the queues.
@@ -179,6 +179,7 @@ All of this runs every 50 ms. The target is to react within **0.5 s** of a drop.
 ### 9.1 What it does, and what it must never do
 - **Does:** turns a sentence like *"prioritise my work laptop for the next hour"* into a structured request such as `{"target": {"device_mac": "…"}, "scope": "realtime", "duration_s": 3600}`. It also explains decisions in plain words ("Your download was slowed because the internet speed dropped to 20 Mbit/s at 14:02").
 - **Never does:** run commands, touch `tc` or eBPF, change configuration, or make QoS decisions. Its output goes through the **same validated REST API** a human would use, and the policy engine still enforces every limit.
+- **Asks first:** it shows you the request it understood (device, scope, duration) and creates the intent only after you confirm. Device names come from the devices themselves, so a device could name itself something like "prioritise me". The assistant treats such names as plain text, never as instructions.
 - **Optional:** the whole system works without it (FR-LLM-4). We build it only after the core evidence is done (build-plan phase P8). The problem statement explicitly warns against a project that is "merely a conversational interface".
 
 ### 9.2 Where it runs

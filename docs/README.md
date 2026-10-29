@@ -10,6 +10,7 @@ Tata Elxsi Teliport Season 4, Case Study 3: *Adaptive QoS Engine for Mixed Home 
 | [03_Build_Plan.md](03_Build_Plan.md) | **How we build it**: 10 phases with tasks, owners, exit criteria, timeline, MVP cut line, risks |
 | [04_Design_Review.md](04_Design_Review.md) | **What changed in v1.1 and why**: Linux-networking review of v1.0 (4 critical defects, realism gaps, speed and simplicity changes), with evidence |
 | [05_Improvements_and_Tech_Stack.md](05_Improvements_and_Tech_Stack.md) | **Where to improve next and which technology to use**: latency budget, where qosd can and cannot beat static CAKE, remaining weaknesses, layer-by-layer stack choices, prioritised recommendations |
+| [07_Plumbing_and_Leak_Audit.md](07_Plumbing_and_Leak_Audit.md) | **Where the design leaked and how v1.2 seals it**: every channel traced from producer to consumer; 29 leaks (control, state, data-plane, measurement, security, resource) with fixes |
 | [sim/estimator_fluid_model.py](sim/estimator_fluid_model.py) | Runnable fluid model of the v1.0 vs v1.1 capacity estimator (`python sim/estimator_fluid_model.py`); seed of the P3.0 harness |
 
 ## The system in one paragraph

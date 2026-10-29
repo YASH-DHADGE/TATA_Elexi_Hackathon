@@ -1,7 +1,7 @@
 # Improvements and Tech Stack: Reasoning
 
 **Date:** 2026-10-29
-**Applies to:** design v1.1 (`02_System_Design.md`), after the review in `04_Design_Review.md`
+**Applies to:** design v1.1 (`02_System_Design.md`), after the review in `04_Design_Review.md`. Still valid for v1.2: the leak audit (`07_Plumbing_and_Leak_Audit.md`) did not close any W-item below, but added safety rules to W6.
 **Purpose:** reason from first principles about where `qosd` can still be improved, and which technology to use in each layer for the best results within a hackathon. Statements that need checking on the real system are marked **[verify]**. Versions are not pinned here; P0 pins them in `versions.lock`.
 
 ---
@@ -90,7 +90,7 @@ Public hosts rate-limit or deprioritise ICMP, and a single reflector's path can 
 **Improve:** a reflector pool (for example 6–10 well-spread anycast DNS resolvers), health scoring, and replacement of reflectors that stop answering or whose baseline drifts. Keep the 2-of-N vote. The testbed does not exercise this, so document it as a production item.
 
 ### W6 Intent UX names devices by IP or MAC (impact: medium for the demo, effort: S)
-**Improve:** show device names from the gateway's DHCP leases (hostname) and let the user rename them. "Prioritise *Work laptop* for 1 h" demos much better than an IP address. No payload or DPI is involved.
+**Improve:** show device names from the gateway's DHCP leases (hostname) and let the user rename them. "Prioritise *Work laptop* for 1 h" demos much better than an IP address. No payload or DPI is involved. **Safety (v1.2, L-09):** a hostname is chosen by the device itself, so it is untrusted input. Limit it to 32 printable characters, show it quoted, never let it act as an instruction to the LLM assistant, and require user confirmation before any intent is created (NFR-SEC-5).
 
 ### W7 Portability of the datapath (impact: medium, effort: S–M)
 tcx needs kernel ≥ 6.6. OpenWrt 24.10 ships 6.6, but OpenWrt 23.05 (5.15) and many RDK-B/prplOS builds use older kernels.
@@ -155,7 +155,7 @@ For each layer: what we use, what else was considered, and why. **Verdict:** Kee
 | A2 | `vc_sim` and `game_sim` in Go with kernel receive timestamps | Measurement accuracy | S |
 | A3 | Early-packet features (first 8 sizes with direction) in `flow_val` and the feature schema (W2) | Classification accuracy, faster provisional class | S |
 | A4 | Probability calibration on the validation split (W2) | Meaningful confidence (constraint C-5) | S |
-| A5 | Device names from DHCP leases in the intent page (W6) | Demo clarity | S |
+| A5 | Device names from DHCP leases in the intent page (W6), treated as untrusted input (NFR-SEC-5) | Demo clarity | S |
 | A6 | clsact fallback implemented and tested (W7) | Portability, production story | S–M |
 | A7 | TR-181 / USP mapping table in the limitations (W10) | Production-boundary clarity | S |
 | A8 | Generator logs as Parquet | Faster analysis of about 200 runs | S |

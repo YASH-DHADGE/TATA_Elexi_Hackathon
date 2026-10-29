@@ -1,7 +1,7 @@
 # Build Plan: phased implementation
 
 **Project:** Adaptive QoS Engine for Mixed Home Broadband Traffic (`qosd`)
-**Document version:** 1.1 (2026-10-29: applies `04_Design_Review.md`)
+**Document version:** 1.2 (2026-10-30: applies `07_Plumbing_and_Leak_Audit.md`; v1.1 applied `04_Design_Review.md`)
 **Date:** 2026-10-28
 **Related:** `01_SRS.md`, `02_System_Design.md`, `04_Design_Review.md`
 
@@ -39,7 +39,7 @@ One person can hold more than one role. With fewer than four people, merge R4 in
 ---
 
 ## Phase 0: Environment and risk spikes
-**Goal:** a reproducible Linux environment, a repository skeleton, and proof (or disproof) of the 13 technical assumptions in design §22 before anything depends on them. SP-8, SP-9 and SP-13 are the most important new ones: they protect the shaper against the direct-path bypass (R-02) and the estimator against its own queue (R-08).
+**Goal:** a reproducible Linux environment, a repository skeleton, and proof (or disproof) of the 16 technical assumptions in design §22 before anything depends on them. SP-8, SP-9 and SP-13 are the most important new ones: they protect the shaper against the direct-path bypass (R-02) and the estimator against its own queue (R-08).
 **Owner:** R1 (spikes), R2 (repo), all (environment)
 
 ### Tasks
@@ -49,7 +49,7 @@ One person can hold more than one role. With fewer than four people, merge R4 in
 | P0.2 | Install the toolchain (commands below) and generate `versions.lock` | R1 |
 | P0.3 | Create the repository with the layout in design §18, `Makefile` targets, `.gitignore`, `config.example.yaml`, `THIRD_PARTY.md` stub, pre-commit secret scan | R2 |
 | P0.4 | CI: `go test`, Python lint and tests, secret scan on every pull request. Root integration tests (namespaces, tc, eBPF) on GitHub-hosted `ubuntu-24.04` runners, which have passwordless sudo; check whether `sch_cake` loads there, otherwise those tests run in the VM only | R2 |
-| P0.5 | Run spikes SP-1 … SP-13 (design §22). Write each result (pass / fail / fallback chosen) in `docs/spikes.md` | R1 |
+| P0.5 | Run spikes SP-1 … SP-16 (design §22). Write each result (pass / fail / fallback chosen) in `docs/spikes.md` | R1 |
 | P0.6 | Confirm every dependency's license from its LICENSE file; fill `THIRD_PARTY.md` | R4 |
 
 ### Environment commands (run inside the VM; record what actually gets installed)
@@ -75,7 +75,7 @@ VM snapshot, repo skeleton, CI green, `versions.lock`, `docs/spikes.md`, `THIRD_
 
 ### Exit criteria
 - [ ] All team members can build the empty agent and run `make test` in the VM.
-- [ ] Each spike SP-1 … SP-13 is marked pass, or has a chosen and tested fallback.
+- [ ] Each spike SP-1 … SP-16 is marked pass, or has a chosen and tested fallback.
 - [ ] `versions.lock` committed.
 
 ---
@@ -111,12 +111,12 @@ VM snapshot, repo skeleton, CI green, `versions.lock`, `docs/spikes.md`, `THIRD_
 ### Tasks
 | ID | Task | Owner |
 |---|---|---|
-| P2.1 | `bpf/flow.bpf.c`: parse Ethernet (+802.1Q) → IPv4 (IHL, fragments) / IPv6 (≤ 4 extension headers) → TCP/UDP; canonical key; GSO-aware per-direction counters, histogram, inter-arrival sums; `class_map` lookup; `skb->priority` written **only** for codes 1–4, the fast lane or gateway-to-LAN traffic (FR-ENF-7); `skb->mark` for upload; pure-ACK promotion; "20th packet" ring-buffer event (design §4, §5.1, §6.2) | R1 |
+| P2.1 | `bpf/flow.bpf.c`: parse Ethernet (+802.1Q) → IPv4 (IHL, fragments) / IPv6 (≤ 4 extension headers) → TCP/UDP; canonical key; GSO-aware per-direction counters, histogram, inter-arrival sums; `class_map` lookup; `skb->priority` written **only** for codes 1–4, the fast lane or gateway-to-LAN traffic (FR-ENF-7); `skb->mark` for upload; pure-ACK promotion; "20th packet" event with the `old < 20 && old + n >= 20` rule; fragments kept in DEFAULT; L3-length size bins; `device_pin` lookup on a miss; `wan_egress` fast lane that keeps the probes' direct path; return `TCX_NEXT` (design §4, §5.1, §6.2) | R1 |
 | P2.2 | Build with `bpf2go` (UAPI headers only, no CO-RE); attach with tcx (or the SP-1 fallback); links not pinned (FR-SAF-3) | R1 |
 | P2.3 | eBPF tests with `BPF_PROG_TEST_RUN`: IPv4 TCP/UDP, IPv6 TCP/UDP, IPv4 options, VLAN, IPv4/IPv6 fragments (assert no port read), extension-header chains, pure ACKs, GSO packets, unclassified packets (assert priority unchanged), malformed packets → `unparsed` | R1 |
-| P2.4 | Enforcer: render the HTB trees and leaves on `lan0` and `wan0` (design §7, including `stab`, explicit burst/quantum, CAKE STREAM/BULK leaves) into one `tc -batch` file; runtime `class change` over netlink with explicit `quantum`/`burst`/`cburst`; low-rate fq_codel adjustment; snapshot / restore; audit log | R2 |
-| P2.5 | Agent skeleton: config loading and validation, structured logging, health endpoint, systemd unit with watchdog, `StartLimit*` and `ReadWritePaths` (design §5.9), `qos-safe-mode` script | R2 |
-| P2.5a | Flow reaper (idle 30 s, FIN/RST 5 s) and netlink neighbour-event subscription | R2 |
+| P2.4 | Enforcer: render the HTB trees and leaves on `lan0` and `wan0` (design §7, including `stab`, explicit burst/quantum, CAKE STREAM/BULK leaves) into one `tc -batch` file; runtime `class change` over netlink with explicit `quantum`/`burst`/`cburst`; low-rate fq_codel adjustment. The enforcer is the **single writer**: one goroutine with a coalescing command queue, rate fast path from the estimator, 1 s `class_map` reconciliation, restore by re-rendering from current inputs; bounded audit log (design §5.6) | R2 |
+| P2.5 | Agent skeleton: config loading and validation, structured logging, health endpoint, systemd unit with a **heartbeat-gated** watchdog, `StartLimit*` and `ReadWritePaths` (design §5.9), `qos-safe-mode` script, `state.json` written every 1 s, logs in a 16 MB tmpfs ring, startup `MARK_CONFLICT` scan | R2 |
+| P2.5a | Flow reaper (idle 30 s, FIN/RST 5 s); user-space flow-state GC; netlink neighbour **and** address subscriptions with `ENOBUFS` resync and a 60 s full resync; `gw_addrs` updates | R2 |
 | P2.6 | Debug CLI: `qosd-ctl set-class <flow> <class>`, `qosd-ctl flows` | R2 |
 
 ### Exit criteria
@@ -138,7 +138,7 @@ VM snapshot, repo skeleton, CI green, `versions.lock`, `docs/spikes.md`, `THIRD_
 |---|---|
 | P3.0 | **Build the simulation harness first** (fluid queue model; port `docs/sim/estimator_fluid_model.py` to Go tests). It must place T_obs correctly: download measured after the bottleneck (min(offered, capacity)), upload before it (min(offered, R)). Write the S2, S5 and S11 traces as failing tests before writing the estimator; v1.0's load-gate defect (R-01) shows up only with this model |
 | P3.1 | ICMP prober: 3 reflectors at 10 Hz each, `SO_PRIORITY` = HTB direct path (FR-EST-9, SP-8), IPv4 and IPv6 |
-| P3.2 | Estimator per design §8.2, 50 ms tick: smoothed RTT, idle-only baseline drift, ΔD, T_obs on the bottleneck side (download: eBPF `dir_bytes` arrival counter), cut without load gate, escalating cuts only while ΔD rises, capacity-drop cut + DRAIN, fast recovery toward R_hw, probe backoff, PROBING_UP, EXTERNAL_BLOAT, LINK_DEGRADED, oscillation freeze |
+| P3.2 | Estimator per design §8.2, 50 ms tick: smoothed RTT, idle-only baseline drift, ΔD, T_obs on the bottleneck side (download: eBPF `dir_bytes` arrival counter), cut without load gate, escalating cuts only while ΔD rises, capacity-drop cut + DRAIN, fast recovery toward R_hw, probe backoff, PROBING_UP, EXTERNAL_BLOAT, LINK_DEGRADED, oscillation freeze, **ACQUIRE** at start and re-acquisition dips (FR-EST-11), probe-table expiry |
 | P3.3 | C_est (EWMA of saturated T_obs) and R_hw; export the true emulator rate as a metric in the testbed for MAPE |
 | P3.4 | Persistent netlink socket for upload root-class byte counters; per-CPU map read for download arrival bytes (no exec on the 50 ms path) |
 | P3.5 | Scenarios S2, S5 and S11 in the runner; compare B1 vs B2 (rule classifier or no classifier at this point) |
@@ -161,8 +161,8 @@ VM snapshot, repo skeleton, CI green, `versions.lock`, `docs/spikes.md`, `THIRD_
 | ID | Task |
 |---|---|
 | P4.1 | **Record mode** in the agent: write one feature row per flow per cycle (design §6.3) as JSON Lines, joined with generator ground truth by 5-tuple and time |
-| P4.2 | Dataset generation: many randomised runs of every generator alone and in mixes; both port configurations (distinctive ports vs everything on 443); confounders (design §16.2). Fixed seeds, all stored |
-| P4.3 | Splits by **run/scenario** (never by window): train / validation / test, plus a cross-scenario holdout (train on some scenarios, test on others) |
+| P4.2 | Dataset generation: many randomised runs of every generator alone and in mixes; **random generator mixes per client namespace in every run**; **DSCP marking randomised per run**; both port configurations (distinctive ports vs everything on 443); confounders (design §16.2). The S10 call profile is held out from all training runs. Fixed seeds, all stored |
+| P4.3 | Splits by **run/scenario** (never by window): train / validation / test, plus a cross-scenario holdout (train on some scenarios, test on others). **Leakage check** (NFR-ACC-5): a model on only port bucket, DSCP and flows-per-device must score clearly below the full model; otherwise fix the dataset before reporting accuracy |
 | P4.4 | Rule classifier (design §8.1) implemented in Go; evaluated on the same test sets |
 | P4.5 | LightGBM training (`ml/train.py`): multiclass, early stopping; feature importance; calibration (reliability diagram, ECE) |
 | P4.6 | Threshold selection on the validation set: abstain (0.60), switch (0.85) and windows (3); plot selective accuracy vs coverage |
@@ -191,12 +191,12 @@ VM snapshot, repo skeleton, CI green, `versions.lock`, `docs/spikes.md`, `THIRD_
 ### Tasks
 | ID | Task |
 |---|---|
-| P5.1 | Policy FSM (design §9.1); profiles NORMAL / INTENT; validation of floors, ceilings and sums (FR-POL-*); dwell time; decision log |
-| P5.2 | Intent leases: create / list / cancel / expire; max 3; device by IP or MAC (neighbour table); `scope` realtime / all; pinning rule (FR-INT-4) |
-| P5.3 | REST API (design §11): token auth, LAN-only listener, schema validation, rate limit, error codes |
-| P5.4 | Overrides: per flow and persisted rules; corrected labels logged for retraining (FR-CLS-8, FR-CLS-11) |
-| P5.5 | Verifier (design §8.3): verdicts, rollback on safety violation, SAFE_MODE after 2 rollbacks in 5 min, oscillation freeze hook |
-| P5.6 | Safety: safe config on start (FR-SAF-1), watchdog, `ExecStopPost`, SAFE_MODE retry policy (FR-SAF-4), `/run/qosd/state.json` for last R |
+| P5.1 | Policy FSM (design §9.1); profiles NORMAL / INTENT; validation of floors, ceilings (RT ceiling minimum 4 Mbit/s) and sums (FR-POL-*); intent coalescing (1 s); `Scale(R)` rate fast path; the **class resolver** with fixed precedence (FR-POL-7); internal SAFE_MODE; decision log |
+| P5.2 | Intent leases: create / list / cancel / expire; max 3; device by IP or MAC (neighbour table, re-resolved on every change); `scope` realtime / all; pinning rule (FR-INT-4) and `device_pin` for `scope=all`; monotonic deadlines; persistence and restore across restarts (FR-INT-2) |
+| P5.3 | REST API (design §11): bearer token for API clients, session sign-in for the web page (token never in the page), `Host` check, LAN-only listener, separate aggregate `/metrics` listener, schema validation, rate limit, error codes |
+| P5.4 | Overrides: per flow and persisted rules (`match` schema, at most 256, 30-day expiry, `GET`/`DELETE /overrides`); corrections log (FR-CLS-8, FR-CLS-11) |
+| P5.5 | Verifier (design §8.3): verdicts incl. UNKNOWN for truncated windows, rollback as the **inverse** of the specific action (FR-VER-5), SAFE_MODE after 2 rollbacks in 5 min |
+| P5.6 | Safety: safe config on start (FR-SAF-1), watchdog, `ExecStopPost`, SAFE_MODE retry policy (FR-SAF-4), heartbeat-gated watchdog (FR-SAF-5) |
 | P5.7 | Fuzz test: random inputs never produce a config violating the bounds |
 
 ### Exit criteria
@@ -205,6 +205,7 @@ VM snapshot, repo skeleton, CI green, `versions.lock`, `docs/spikes.md`, `THIRD_
 - [ ] S8: SAFE_MODE installed within 10 s of `kill -9` (NFR-REL-1); traffic never left unshaped.
 - [ ] Injected starvation or latency regression causes a rollback; a second one within 5 min causes SAFE_MODE.
 - [ ] Bounds fuzz test passes.
+- [ ] Leak tests (`07_Plumbing_and_Leak_Audit.md`): deleting a `class_map` entry by hand is healed within 1 s; restarting the agent during a running download triggers ACQUIRE and the bloat is detected; a deadlocked loop (test hook) stops watchdog pings and leads to safe mode; an intent survives an agent restart; stepping the system clock does not change lease expiry; a DHCP hostname containing instructions is quoted and cannot create an intent without confirmation.
 
 ---
 
@@ -233,7 +234,7 @@ VM snapshot, repo skeleton, CI green, `versions.lock`, `docs/spikes.md`, `THIRD_
 ### Tasks
 | ID | Task |
 |---|---|
-| P7.1 | Runner completes the matrix: S1–S11 × {B0, B1, B2-rules, B2-ML}; ≥ 5 repeats (10 for S1, S2, S10); S2, S5, S11 once more with the bytes buffer model (stress test); INVALID runs kept and explained |
+| P7.1 | Runner resets all agent state before every run (FR-EXP-5) and completes the matrix: S1–S11 × {B0, B1, B2-rules, B2-ML}; ≥ 5 repeats (10 for S1, S2, S10); S2, S5, S11 once more with the bytes buffer model (stress test); INVALID runs kept and explained |
 | P7.2 | Analysis: all metric formulas in design §17; mean ± 95% CI; starvation check; adaptation time; stability counts |
 | P7.3 | Report generator: one Markdown/HTML report with charts per scenario, a summary table against every SRS target (met / not met), and environment metadata |
 | P7.4 | Overhead: agent CPU and memory at 100 Mbit/s; eBPF forwarding cost and ns per packet per program (`kernel.bpf_stats_enabled`); one S1 run with offloads on (GSO-aware counting); optionally on a Raspberry Pi 4 (labelled as hardware) |
@@ -251,7 +252,7 @@ VM snapshot, repo skeleton, CI green, `versions.lock`, `docs/spikes.md`, `THIRD_
 
 | ID | Task | Owner |
 |---|---|---|
-| P8.1 | LLM assistant (design §5.13): local model through Ollama or a hosted API; tools `create_intent`, `get_state`, `get_decisions`, `list_flows`; JSON-schema validation; 100-utterance evaluation vs a regex parser | R2 |
+| P8.1 | LLM assistant (design §5.13): local model through Ollama or a hosted API; tools `create_intent`, `get_state`, `get_decisions`, `list_flows`; JSON-schema validation; user confirmation before `create_intent`; device names length-limited and quoted; remote addresses pseudonymised in hosted mode; 100-utterance evaluation vs a regex parser, including prompt-injection cases | R2 |
 | P8.2 | Hardware demo: run the agent on a Raspberry Pi 4 (or an OpenWrt-capable router) with a USB Ethernet adapter; measure CPU; label results as hardware | R1 |
 | P8.3 | Early prototype of one-way-delay direction attribution | R2 |
 
@@ -319,6 +320,8 @@ If time runs short, cut from the bottom up. Never cut anything above the line.
 | Estimator oscillates or recovers slowly | Medium | High | Simulation harness first, with T_obs placed correctly (P3.0); two-speed recovery; evidence-based tuning; freeze guard |
 | Unclassified traffic silently bypasses the shaper via HTB's direct path | Medium (easy mistake) | High | FR-ENF-7, SP-9, unit test, P2 exit criterion on `direct_packets_stat` |
 | B1 (static CAKE) matches B2 on S1, so the classifier shows no outcome benefit | High | High | S10 designed to need correct classification (NFR-UX-7); report S1 honestly. B2 also wins on S2, S5, S7 and S11 through adaptation and intents |
+| Label leakage makes synthetic accuracy meaningless (device = class, DSCP, S10 seen in training) | High | High | Randomised device mixes and DSCP, held-out S10 profile, leakage check before reporting (NFR-ACC-5) |
+| Concurrency or state bugs between estimator, policy and enforcer | Medium | High | Single writer, reconciliation loop, heartbeat-gated watchdog, leak tests in the P5 exit criteria |
 | Model trained with offloads off behaves differently with GRO on | Medium | Medium | GSO-aware counting; one offloads-on run; deployment offload setting recorded in the model card |
 | Testbed results not reproducible across machines | Medium | High | Pinned versions, VM snapshot, seeds, offloads off, repeated runs with CIs |
 | Team member unavailable | Medium | Medium | Two people know each module (pair reviews); docs per module |

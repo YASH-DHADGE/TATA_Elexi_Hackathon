@@ -3,7 +3,7 @@
 > **Tata Elxsi Teliport Season 4, Case Study 3**
 > An intent-aware, privacy-safe Quality-of-Service controller for a Linux home gateway.
 
-![Status](https://img.shields.io/badge/status-design%20v1.1-blue)
+![Status](https://img.shields.io/badge/status-design%20v1.2-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux%20(eBPF%20%2B%20tc)-informational)
 ![Agent](https://img.shields.io/badge/agent-Go-00ADD8)
 ![ML](https://img.shields.io/badge/classifier-LightGBM-success)
@@ -119,6 +119,7 @@ These are **targets** to be measured and reported honestly, met or not. Each is 
 | [Build Plan](docs/03_Build_Plan.md) | Phases P0–P9 with tasks, exit criteria, timeline, MVP cut line and risks |
 | [Design Review v1.0 → v1.1](docs/04_Design_Review.md) | Linux-networking review of the first design: defects found, fixes and evidence |
 | [Improvements and Tech Stack](docs/05_Improvements_and_Tech_Stack.md) | Latency budget, where qosd can and cannot beat static CAKE, roadmap, layer-by-layer stack reasoning |
+| [Plumbing and Leak Audit](docs/07_Plumbing_and_Leak_Audit.md) | Every channel traced end to end; 29 leaks found and the v1.2 fixes |
 
 ## Try the estimator model
 
@@ -149,6 +150,7 @@ Indicative results from this model (the real testbed will decide):
     ├── 04_Design_Review.md        v1.0 → v1.1 review
     ├── 05_Improvements_and_Tech_Stack.md
     ├── 06_How_It_Works.md         plain-language guide
+    ├── 07_Plumbing_and_Leak_Audit.md
     └── sim/
         └── estimator_fluid_model.py
 ```
@@ -157,8 +159,9 @@ The planned code layout (`bpf/`, `cmd/qosd/`, `internal/`, `ml/`, `testbed/`, `e
 
 ## Project status
 
-- [x] Requirements, system design and build plan (v1.1)
+- [x] Requirements, system design and build plan (v1.2)
 - [x] Design review with an estimator simulation
+- [x] Plumbing and leak audit
 - [ ] P0: environment and kernel spikes
 - [ ] P1: testbed, traffic generators and baselines
 - [ ] P2–P7: datapath, estimator, classifier, policy, dashboard, full evaluation

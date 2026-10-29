@@ -2,7 +2,7 @@
 
 **Project:** Adaptive QoS Engine for Mixed Home Broadband Traffic (working name: `qosd`)
 **Hackathon:** Tata Elxsi Teliport Season 4, Case Study 3
-**Document version:** 1.1 (2026-10-29: estimator, datapath and scenario fixes from `04_Design_Review.md`)
+**Document version:** 1.2 (2026-10-30: plumbing and leak fixes from `07_Plumbing_and_Leak_Audit.md`; v1.1 2026-10-29: fixes from `04_Design_Review.md`)
 **Date:** 2026-10-28
 **Structure:** loosely follows ISO/IEC/IEEE 29148:2018 (requirements engineering)
 
@@ -106,13 +106,14 @@ Priority uses MoSCoW: **M** = Must, **S** = Should, **C** = Could.
 |---|---|---|
 | FR-TEL-1 | The system shall collect per-flow counters in both directions: packets, bytes, packet-size histogram (8 bins), inter-arrival-time sum and sum of squares, first-seen and last-seen timestamps | M |
 | FR-TEL-2 | Collection shall use packet headers only. No payload byte shall be read, stored or exported | M |
-| FR-TEL-3 | Telemetry shall cover IPv4 and IPv6 TCP and UDP flows. The parser shall honour the IPv4 header length (IHL), accept one 802.1Q tag, and walk at most 4 IPv6 extension headers. For non-first fragments (IPv4 fragment offset ≠ 0, or an IPv6 Fragment header with offset ≠ 0) it shall not read L4 ports, because those bytes are payload. Packets that cannot be parsed shall be counted in an "unparsed" counter and treated as DEFAULT | M |
+| FR-TEL-3 | Telemetry shall cover IPv4 and IPv6 TCP and UDP flows. The parser shall honour the IPv4 header length (IHL), accept one 802.1Q tag, and walk at most 4 IPv6 extension headers. For non-first fragments (IPv4 fragment offset ≠ 0, or an IPv6 Fragment header with offset ≠ 0) it shall not read L4 ports, because those bytes are payload. Every fragment of a fragmented datagram (more-fragments flag set or offset ≠ 0) shall be enqueued in DEFAULT, so one datagram never spans two queues. Packets that cannot be parsed shall be counted in an "unparsed" counter and treated as DEFAULT | M |
 | FR-TEL-4 | The flow table shall have a fixed maximum size with automatic eviction of the least-recently-used entries | M |
 | FR-TEL-5 | The system shall sample per-class queue statistics (bytes, packets, drops, backlog) from `tc` at least once per second | M |
 | FR-TEL-6 | The system shall measure round-trip time to at least three configurable reflectors at 10 Hz each | M |
 | FR-TEL-7 | The system shall map device MAC addresses to their current IPv4 and IPv6 addresses using the kernel neighbour table, updated from netlink neighbour events | S |
 | FR-TEL-8 | Flows idle for 30 s, or for 5 s after a TCP FIN or RST, shall be removed from the flow and class maps | S |
 | FR-TEL-9 | Packet counts shall count GSO/GRO segments (`max(1, gso_segs)`), so counters stay correct with offloads enabled | M |
+| FR-TEL-10 | Packet-size features shall use the L3 length (IP total length; for GSO packets the segment size plus headers), not the frame length, so link framing (Ethernet, VLAN, PPPoE) does not change the features | M |
 
 ### 3.2 Classification (CLS)
 | ID | Requirement | Pri |
@@ -124,7 +125,7 @@ Priority uses MoSCoW: **M** = Must, **S** = Should, **C** = Could.
 | FR-CLS-5 | A classified flow shall change class only if the smoothed probability of the new class exceeds 0.85 for 3 consecutive cycles (hysteresis) | M |
 | FR-CLS-6 | Guardrail G1: a flow in RT (classified or intent-pinned) that exceeds 8 Mbit/s for at least 5 s shall be moved to STREAM. STREAM, not BULK, because high-rate real-time traffic such as cloud gaming exists | M |
 | FR-CLS-7 | Guardrail G2: a DEFAULT flow that has transferred at least 20 MB, with no idle gap of 2 s or more in the last 10 s, shall be reclassified BULK | M |
-| FR-CLS-8 | Users shall be able to correct a flow's class through the API. The correction takes effect within one classification cycle and can optionally persist as a rule for future matching flows | M |
+| FR-CLS-8 | Users shall be able to correct a flow's class through the API, effective within one classification cycle. A correction can optionally persist as a rule `{match: {device_mac, proto?, remote_port?, remote_prefix?}, class, expires_at}`: at most 256 rules, default expiry 30 days, listable and deletable through the API. Non-persisted corrections end with the flow | M |
 | FR-CLS-9 | A deterministic rule-based classifier shall exist and be selectable at runtime, as the baseline for AI comparison | M |
 | FR-CLS-10 | The ML model file shall declare its feature-schema version. On mismatch or load failure the system shall fall back to the rule classifier and raise an alert | M |
 | FR-CLS-11 | Corrected labels shall be logged in a format usable for retraining | S |
@@ -143,6 +144,7 @@ Priority uses MoSCoW: **M** = Must, **S** = Should, **C** = Could.
 | FR-EST-8 | A reflector's baseline RTT shall follow lower samples immediately, and may rise only while L < 0.3 in both directions, so sustained load is never learned as the new baseline | M |
 | FR-EST-9 | Estimator probes shall use the HTB direct path on the WAN interface, so they measure only queues beyond the gateway | M |
 | FR-EST-10 | Probe backoff: a cut that follows an increase and lands at ≥ 0.75 × the rate set by the previous cut is a failed probe; increases then pause for 2 s, doubling with each consecutive failed probe up to 8 s. A cut to below 0.75 × the previous cut's rate is a capacity event and resets the backoff | M |
+| FR-EST-11 | Baseline acquisition: at every agent start (including SAFE_MODE retries), the system shall run R at 0.5 × the best known capacity for 3 s and take the minimum RTT as the baseline before normal operation. If bloat persists for 30 s while cuts no longer reduce ΔD, it shall repeat a 2 s acquisition dip, at most once per 5 minutes | M |
 
 ### 3.4 Policy (POL)
 | ID | Requirement | Pri |
@@ -150,9 +152,10 @@ Priority uses MoSCoW: **M** = Must, **S** = Should, **C** = Could.
 | FR-POL-1 | The policy engine shall implement the states INIT, NORMAL, INTENT_ACTIVE and SAFE_MODE with the transitions defined in the design document | M |
 | FR-POL-2 | Each class shall have a guaranteed rate (floor) and a ceiling, expressed as percentages of R, per profile (table below) | M |
 | FR-POL-3 | The BULK floor shall never be configured below 10% of R in any profile (anti-starvation) | M |
-| FR-POL-4 | The RT ceiling shall never exceed 60% of R in any profile | M |
-| FR-POL-5 | Profile switches shall occur at most once per 5 s, except entry into SAFE_MODE, which is immediate | M |
+| FR-POL-4 | The RT ceiling shall not exceed 60% of R in any profile, except that it is never lowered below min(R, 4 Mbit/s), so a call is not capped on a slow but otherwise idle link. Floors still guarantee every other class its share under contention | M |
+| FR-POL-5 | Profile switches caused by intents shall be applied within 1 s; intent events within 1 s of each other are coalesced into one switch. Entry into SAFE_MODE is immediate | M |
 | FR-POL-6 | Every policy decision shall be logged with a timestamp, reason code, inputs summary and resulting configuration | M |
+| FR-POL-7 | One class resolver shall decide each flow's final class with the precedence: user override > guardrails (G1, G2) > intent pin > model or rules > none (user overrides are exempt from guardrails but bounded by the RT ceiling). The enforcer shall reconcile the kernel class table with the resolver's output at least once per second, rewriting missing or different entries | M |
 
 **Profiles (percent of shaper rate R):**
 
@@ -176,18 +179,20 @@ Priority uses MoSCoW: **M** = Must, **S** = Should, **C** = Could.
 | FR-ENF-7 | The datapath shall write `skb->priority` only for a valid class code (1–4) or the fast-lane rule. It shall never produce the HTB handle value (`1:0`) for client traffic, because that value selects HTB's unshaped direct queue | M |
 | FR-ENF-8 | Link-layer overhead and minimum packet unit shall be configurable and applied to all shapers (`stab` on HTB, `overhead`/`mpu` on CAKE) | M |
 | FR-ENF-9 | On upload, pure TCP ACKs (ACK flag only, no payload, determined from header length fields) of a BULK flow shall be enqueued in DEFAULT, and the upload BULK leaf shall use CAKE `ack-filter` | S |
-| FR-ENF-10 | Fast lane: packets of flows without a class shall be enqueued in RT if they are DNS (port 53), ICMP/ICMPv6, or non-IP frames | S |
+| FR-ENF-10 | Fast lane: packets of flows without a class shall be enqueued in RT if they are DNS (port 53), ICMP/ICMPv6, or non-IP frames. On the WAN interface the same applies to unmarked router-originated packets (e.g. ARP and PPPoE control), except packets already on the direct path | S |
 | FR-ENF-11 | HTB `quantum`, `burst` and `cburst` shall be set explicitly on every class create and change. When the shaper rate is low, the fq_codel target shall be raised to at least 1.5 × the MTU transmission time at R | M |
+| FR-ENF-12 | All changes to tc and the kernel class table shall go through a single enforcer writer. Shaper-rate changes take a fast path (estimator → class-rate scaling → enforcer) that does not wait for the policy tick: decreases immediately, increases at most every 250 ms and only if the change is ≥ 1% | M |
 
 ### 3.6 Intent (INT)
 | ID | Requirement | Pri |
 |---|---|---|
 | FR-INT-1 | A REST API shall allow creating, listing and cancelling intents. An intent names a target device (IP or MAC), a scope (`realtime` or `all`), and a duration between 60 s and 14,400 s | M |
-| FR-INT-2 | Intents shall expire automatically. When the last intent ends, the system shall return to NORMAL | M |
+| FR-INT-2 | Intents shall expire automatically, timed on the monotonic clock. Active intents shall be persisted and restored after an agent restart if the clock is synchronised and they have not expired; otherwise the loss is logged and shown to the user. When the last intent ends, the system shall return to NORMAL | M |
 | FR-INT-3 | At most 3 intents shall be active at once | M |
 | FR-INT-4 | Scope `realtime` pins the device's flows whose RT probability is at least 0.4 to RT. Scope `all` pins all the device's flows to RT. In both cases the RT ceiling and guardrail G1 apply, so a pinned high-rate flow (e.g. a sync job) cannot crowd out the call it is meant to protect | M |
 | FR-INT-5 | A minimal web page served by the agent shall let a user create and cancel intents and correct flow classes | S |
 | FR-INT-6 | The API shall require a bearer token, listen only on the LAN address, and rate-limit to 10 requests/s per client | M |
+| FR-INT-7 | For an intent with scope `all`, new flows of the target device shall receive RT from their first packet (a device-level pin consulted when a flow has no class yet) | S |
 
 ### 3.7 Verification (VER)
 | ID | Requirement | Pri |
@@ -196,6 +201,7 @@ Priority uses MoSCoW: **M** = Must, **S** = Should, **C** = Could.
 | FR-VER-2 | The system shall roll back an action when a safety violation occurs: a backlogged class receives zero throughput for ≥ 5 s, or RT-probe p95 RTT exceeds 2× its pre-action value and is more than 20 ms higher. The estimator's rate changes are not subject to rollback (FR-EST-* has its own guards). A latency regression shall not be attributed to a policy action while the estimator is cutting or draining | M |
 | FR-VER-3 | Two rollbacks within 5 minutes, or any failed restore, shall trigger SAFE_MODE | M |
 | FR-VER-4 | If more than 10 probe cycles (an increase followed by a cut) occur within a minute, increases shall be frozen for 60 s (oscillation guard; FR-EST-10 normally keeps the rate lower) | M |
+| FR-VER-5 | A rollback shall apply the inverse of the specific action (cancel the intent, remove the override, restore the previous model, configuration or classifier mode); actions without an inverse (intent expiry) only raise an alert. A restore after a failed apply shall re-render the desired state from current inputs, never replay an older snapshot. Verdict windows end at the next policy action; a window shorter than 5 s yields UNKNOWN | M |
 
 ### 3.8 Safety (SAF)
 | ID | Requirement | Pri |
@@ -204,6 +210,7 @@ Priority uses MoSCoW: **M** = Must, **S** = Should, **C** = Could.
 | FR-SAF-2 | If the agent stops or crashes, a supervisor shall install SAFE_MODE: CAKE at 80% of the last known shaper rate, or the configured fallback rate if none is known | M |
 | FR-SAF-3 | eBPF programs shall detach automatically when the agent process exits (no pinned links), so traffic falls back to the HTB default class | M |
 | FR-SAF-4 | SAFE_MODE shall be retried out of automatically after 60 s of passing health checks, at most 3 times per hour | S |
+| FR-SAF-5 | The watchdog shall be notified only while every critical loop (estimator, enforcer, classifier, policy) has reported progress within its deadline, so a deadlocked loop leads to a restart and safe mode | M |
 
 ### 3.9 Observability (OBS)
 | ID | Requirement | Pri |
@@ -219,6 +226,7 @@ Priority uses MoSCoW: **M** = Must, **S** = Should, **C** = Could.
 | FR-EXP-2 | Scenarios S1 to S9 (section 6) shall be scripted, with impairment settings stored in version control | M |
 | FR-EXP-3 | Each scenario-configuration pair shall run at least 5 times. Reports shall show mean and 95% confidence interval | M |
 | FR-EXP-4 | Generated datasets and the scripts that produced them shall be included or reproducible from a fixed seed | M |
+| FR-EXP-5 | Every run shall start from empty agent state: persisted intents, overrides, logs and estimator state removed, namespaces and kernel maps recreated; a hash of the starting state is recorded in the run metadata | M |
 
 ### 3.11 Optional LLM assistant (LLM)
 | ID | Requirement | Pri |
@@ -241,6 +249,7 @@ Values marked *target* are goals to be measured and reported honestly, whether m
 | NFR-ACC-2 | *Target:* macro-F1 ≥ 0.95 on the same held-out set |
 | NFR-ACC-3 | Accuracy on consented real-device captures shall be reported separately, without a pass/fail target. The expectation is lower (about 90%) and the report must say so |
 | NFR-ACC-4 | *Target:* capacity estimate MAPE ≤ 10% during saturated periods, against the emulator's true rate |
+| NFR-ACC-5 | The training data shall not leak labels: generator mixes are assigned randomly to client namespaces in every run, DSCP marking is randomised per run, no identifiers are used as features, S10 uses a call profile held out from training, and a model trained only on port, DSCP and device-context features must score clearly below the full model before any accuracy is reported |
 
 ### 4.2 Performance and footprint
 | ID | Requirement |
@@ -276,14 +285,18 @@ Values marked *target* are goals to be measured and reported honestly, whether m
 | NFR-REL-1 | *Target:* SAFE_MODE installed within 10 s of agent failure |
 | NFR-REL-2 | *Target:* configuration restore after a failed apply completes within 1 s |
 | NFR-REL-3 | Every automated action is bounded by the limits in section 3, logged, and reversible |
+| NFR-REL-4 | Logs shall be bounded: estimator decisions are logged at state transitions and cuts only, logs live in a 16 MB ring in memory (tmpfs), and flash is written only for intents and overrides |
 
 ### 4.6 Security and privacy
 | ID | Requirement |
 |---|---|
 | NFR-SEC-1 | No secrets in the repository. The repo ships `config.example.yaml` with clearly fictitious values; a pre-commit secret scan is enabled |
 | NFR-SEC-2 | The agent runs with only the capabilities it needs (CAP_NET_ADMIN, CAP_BPF, CAP_NET_RAW, and CAP_PERFMON if the kernel requires it) |
-| NFR-SEC-3 | The API listens on the LAN address only, requires a token, and validates all input against a schema |
+| NFR-SEC-3 | The API listens on the LAN address only, requires authentication, validates all input against a schema, and checks the `Host` header. The web page never contains the token: users sign in once and receive an `HttpOnly`, `SameSite=Strict` session cookie with a CSRF token. Aggregate metrics are served on a separate read-only listener without per-device labels |
+| NFR-SEC-4 | A startup check shall raise `MARK_CONFLICT` if any firewall rule writes packet marks that overlap the configured mark mask |
+| NFR-SEC-5 | Data from devices (e.g. DHCP hostnames) is untrusted: it is length-limited and quoted before reaching the LLM assistant, and the assistant creates an intent only after the user confirms the parsed intent |
 | NFR-PRIV-1 | Packet captures, when used, are truncated to 96 bytes (headers only). Published datasets contain features only, with IP addresses removed or anonymised |
+| NFR-PRIV-2 | A hosted LLM receives pseudonymous device labels and no remote IP or MAC addresses. The decision log keeps 24 h by default, and record mode is disabled in production |
 
 ### 4.7 Reproducibility and maintainability
 | ID | Requirement |
@@ -347,7 +360,7 @@ Values marked *target* are goals to be measured and reported honestly, whether m
 | Do not decrypt | C-1, FR-TEL-2 |
 | Linux tc / inspectable enforcement | FR-ENF-1 |
 | IPv4 and IPv6 | FR-TEL-3, FR-ENF-3, S9 |
-| Rollback, no starvation | FR-ENF-4, FR-VER-2, FR-POL-3, NFR-UX-5 |
+| Rollback, no starvation | FR-ENF-4, FR-VER-2, FR-VER-5, FR-POL-3, NFR-UX-5 |
 | Confidence and correction | FR-CLS-2, FR-CLS-8 |
 | Licenses | NFR-LIC-1 |
 | Generated data and impairment settings included | FR-EXP-2, FR-EXP-4 |
