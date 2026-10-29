@@ -1,0 +1,10 @@
+# Python build artefacts
+__pycache__/
+*.pyc
+
+# Office lock files
+~$*
+
+# Third-party material from Tata Elxsi: not ours to redistribute (constraint C-6)
+Case Study 3_MCV_Adaptive QoS Engine for Mixed Home Broadband Traffic.pdf
+Teliport S4_Submission Template.pptx
